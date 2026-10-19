@@ -1,0 +1,22 @@
+{
+  "name": "github-proxy",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "configure": "node scripts/configure.mjs",
+    "predev": "npm run configure",
+    "dev": "wrangler dev --config wrangler.local.jsonc",
+    "predeploy": "npm run configure",
+    "deploy": "wrangler deploy --config wrangler.local.jsonc",
+    "presecret:put": "npm run configure",
+    "secret:put": "wrangler secret put PROXY_TOKEN --config wrangler.local.jsonc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "types": "wrangler types --config wrangler.jsonc"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "wrangler": "4.151.1"
+  }
+}

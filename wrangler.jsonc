@@ -1,0 +1,61 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // Public template. Run `npm run configure`, then edit wrangler.local.jsonc.
+  // Keep account IDs, real domains and private repository lists in that file.
+  "name": "github-proxy",
+
+  "main": "src/index.ts",
+
+  "compatibility_date": "2026-08-23",
+
+  /*
+   * 推荐使用 Custom Domain。
+   *
+   * 例如：
+   *
+   * ghp.example.com
+   */
+  "routes": [
+    {
+      "pattern": "proxy.example.com",
+      "custom_domain": true
+    }
+  ],
+
+  /*
+   * 开发阶段也可以保留 workers.dev。
+   *
+   * 正式使用自己的域名即可。
+   */
+  "workers_dev": false,
+
+  // Use the account plan's built-in CPU/subrequest limits. Custom limits
+  // are omitted so the default configuration can deploy to Workers Free.
+
+  // Counters are per Cloudflare location, not globally synchronized quotas.
+  // Keep namespace IDs unique within your account.
+  "ratelimits": [
+    {
+      "name": "IP_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "TOTAL_RATE_LIMITER",
+      "namespace_id": "1002",
+      "simple": { "limit": 600, "period": 60 }
+    }
+  ],
+
+  "vars": {
+    // Both settings are required. false disables ALL download exemptions.
+    "ALLOW_ANONYMOUS": "false",
+    // Exact types: gist, raw, releases, archive, ghcr. Empty = none.
+    "ANONYMOUS_ROUTES": "",
+    // Optional exact repository allowlists (comma-separated):
+    // "ALLOWED_GITHUB_REPOSITORIES": "owner/repo",
+    // "ALLOWED_GHCR_REPOSITORIES": "owner/image,owner/nested/image"
+  }
+  // Store PROXY_TOKEN with `npm run secret:put`, never in vars or this file.
+}

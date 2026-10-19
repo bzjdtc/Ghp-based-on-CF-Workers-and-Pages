@@ -1,0 +1,163 @@
+import { manifestAccept, type Route } from "./routes";
+
+const GITHUB_HOSTS = new Set([
+  "github.com", "raw.githubusercontent.com", "gist.githubusercontent.com",
+  "codeload.github.com", "release-assets.githubusercontent.com",
+  "objects.githubusercontent.com", "github-releases.githubusercontent.com",
+]);
+const GHCR_HOSTS = new Set(["ghcr.io", "pkg-containers.githubusercontent.com"]);
+const GIST_HOSTS = new Set(["gist.githubusercontent.com"]);
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 3;
+const HEADER_TIMEOUT_MS = 15_000;
+const MAX_TOKEN_BYTES = 64 * 1024;
+const MAX_TOKENS = 128;
+const tokens = new Map<string, { value: string; expires: number }>();
+
+export class UpstreamError extends Error {
+  constructor(message: string, readonly status = 502) { super(message); }
+}
+
+// Time out waiting for headers, while leaving large response bodies streaming.
+async function fetchHeaders(url: URL, method: string, headers: Headers,
+  signal: AbortSignal): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HEADER_TIMEOUT_MS);
+  try {
+    return await fetch(url.toString(), {
+      method, headers, redirect: "manual",
+      signal: AbortSignal.any([signal, controller.signal]),
+    });
+  } catch {
+    throw new UpstreamError("Upstream request failed or timed out");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchRedirects(route: Route, request: Request,
+  headers: Headers): Promise<Response> {
+  let url = route.target;
+  const allowed = route.kind === "ghcr" ? GHCR_HOSTS
+    : route.target.hostname === "gist.githubusercontent.com" ? GIST_HOSTS : GITHUB_HOSTS;
+  const forwarded = new Headers(headers);
+  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+    if (url.protocol !== "https:" || url.username || url.password ||
+      url.port || !allowed.has(url.hostname)) {
+      throw new UpstreamError("Blocked upstream redirect");
+    }
+    const response = await fetchHeaders(url, request.method, forwarded, request.signal);
+    if (!REDIRECTS.has(response.status)) return response;
+    const location = response.headers.get("Location");
+    await response.body?.cancel();
+    if (!location || redirects === MAX_REDIRECTS) {
+      throw new UpstreamError("Invalid or excessive upstream redirects");
+    }
+    let next: URL;
+    try { next = new URL(location, url); }
+    catch { throw new UpstreamError("Invalid upstream redirect"); }
+    if (next.origin !== url.origin) forwarded.delete("Authorization");
+    url = next;
+  }
+  throw new UpstreamError("Too many upstream redirects");
+}
+
+async function registryToken(repository: string, signal: AbortSignal,
+  authorization?: string): Promise<string> {
+  const url = new URL("https://ghcr.io/token");
+  url.searchParams.set("service", "ghcr.io");
+  if (repository) url.searchParams.set("scope", `repository:${repository}:pull`);
+  const headers = new Headers({
+    "User-Agent": "Personal-GitHub-Proxy/2.0",
+  });
+  // GitHub PATs are sent only to this fixed token endpoint. They are never
+  // forwarded to registry manifests/blobs, redirects, or GitHub file hosts.
+  if (authorization) headers.set("Authorization", authorization);
+  const response = await fetchHeaders(url, "GET", headers, signal);
+  if (!response.ok) {
+    await response.body?.cancel();
+    if (response.status === 401 || response.status === 403) {
+      throw new UpstreamError("GHCR authentication failed or package access denied", 403);
+    }
+    if (response.status === 429) throw new UpstreamError("GHCR rate limit exceeded", 429);
+    throw new UpstreamError("GHCR token service is unavailable");
+  }
+  // Never follow a realm supplied by a client or an upstream challenge.
+  const reader = response.body?.getReader();
+  if (!reader) throw new UpstreamError("Empty GHCR token response");
+  const timeout = setTimeout(() => { void reader.cancel().catch(() => {}); }, HEADER_TIMEOUT_MS);
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let data: { token?: unknown; access_token?: unknown; expires_in?: unknown };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_TOKEN_BYTES) { await reader.cancel(); throw new Error("Oversized token response"); }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    data = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new UpstreamError("Invalid GHCR token response");
+  } finally {
+    clearTimeout(timeout);
+    reader.releaseLock();
+  }
+  const token = data?.token ?? data?.access_token;
+  if (typeof token !== "string" || !token || token.length > 16_384 || /\s/.test(token)) {
+    throw new UpstreamError("Invalid GHCR token");
+  }
+  const lifetime = typeof data.expires_in === "number" && Number.isFinite(data.expires_in)
+    ? Math.min(300, Math.max(0, data.expires_in - 30)) : 60;
+  // Only anonymous tokens enter the shared in-memory cache. Credentialed
+  // requests obtain their own token each time, including after permission changes.
+  if (!authorization) {
+    if (tokens.size >= MAX_TOKENS) tokens.delete(tokens.keys().next().value!);
+    tokens.set(repository, { value: token, expires: Date.now() + lifetime * 1000 });
+  }
+  return token;
+}
+
+export async function fetchUpstream(route: Route, request: Request,
+  ghcrAuthorization?: string): Promise<Response> {
+  const headers = new Headers({ "User-Agent": "Personal-GitHub-Proxy/2.0" });
+  for (const name of ["Range", "If-Range", "If-None-Match", "If-Modified-Since"]) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  if (route.manifest) {
+    headers.set("Accept", manifestAccept(request)!);
+  }
+  if (route.kind === "ghcr" && ghcrAuthorization) {
+    const token = await registryToken(route.repository, request.signal, ghcrAuthorization);
+    headers.set("Authorization", `Bearer ${token}`);
+    const response = await fetchRedirects(route, request, headers);
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel();
+      throw new UpstreamError("GHCR authentication failed or package access denied", 403);
+    }
+    return response;
+  }
+  // Proxy credentials are never forwarded; anonymous tokens stay anonymous.
+  const cachedToken = tokens.get(route.repository);
+  if (route.kind === "ghcr" && cachedToken && cachedToken.expires > Date.now()) {
+    headers.set("Authorization", `Bearer ${cachedToken.value}`);
+  }
+  let response = await fetchRedirects(route, request, headers);
+  if (route.kind === "ghcr" && response.status === 401) {
+    await response.body?.cancel();
+    tokens.delete(route.repository);
+    const token = await registryToken(route.repository, request.signal);
+    headers.set("Authorization", `Bearer ${token}`);
+    response = await fetchRedirects(route, request, headers);
+  }
+  if (route.kind === "ghcr" && (response.status === 401 || response.status === 403)) {
+    await response.body?.cancel();
+    throw new UpstreamError("GHCR package is private or unavailable", 403);
+  }
+  return response;
+}
