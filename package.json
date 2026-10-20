@@ -2,6 +2,7 @@
   "name": "github-proxy",
   "private": true,
   "version": "1.0.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "configure": "node scripts/configure.mjs",
