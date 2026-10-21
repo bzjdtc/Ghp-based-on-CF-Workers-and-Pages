@@ -51,7 +51,7 @@
   "vars": {
     // Both settings are required. false disables ALL download exemptions.
     "ALLOW_ANONYMOUS": "false",
-    // Exact types: gist, raw, releases, archive, ghcr. Empty = none.
+    // Exact types: gist, raw, releases, archive, ghcr, git. Empty = none.
     "ANONYMOUS_ROUTES": "",
     // Optional exact repository allowlists (comma-separated):
     // "ALLOWED_GITHUB_REPOSITORIES": "owner/repo",

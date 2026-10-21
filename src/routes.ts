@@ -1,4 +1,4 @@
-export type ProxyType = "gist" | "raw" | "releases" | "archive" | "ghcr";
+export type ProxyType = "gist" | "raw" | "releases" | "archive" | "ghcr" | "git";
 
 export interface Route {
   kind: "github" | "ghcr";
@@ -8,6 +8,7 @@ export interface Route {
   manifest: boolean;
   ping: boolean;
   ttl: number;
+  git?: "refs" | "upload-pack";
 }
 
 const NAME = /^[a-zA-Z0-9._-]+$/;
@@ -61,7 +62,29 @@ function gistRoute(parts: string[]): Route | null {
     repository: parts.slice(0, 2).join("/"), manifest: false, ping: false, ttl: 3600 };
 }
 
+function gitRoute(parts: string[], url: URL): Route | null {
+  if (!parts[1]?.endsWith(".git")) return null;
+  const repository = [parts[0], parts[1].slice(0, -4)];
+  if (!repository.every(part => part && part !== "." && part !== ".." && NAME.test(part))) return null;
+  const refs = parts.length === 4 && parts[2] === "info" && parts[3] === "refs";
+  const upload = parts.length === 3 && parts[2] === "git-upload-pack";
+  // Smart HTTP discovery has exactly one fixed service parameter. Never relay
+  // arbitrary queries, receive-pack (push), or other repository endpoints.
+  if (refs) {
+    if ([...url.searchParams].length !== 1 || url.searchParams.get("service") !== "git-upload-pack") return null;
+  } else if (!upload || url.search !== "") return null;
+  const upstream = target("github.com", parts);
+  if (refs) upstream.searchParams.set("service", "git-upload-pack");
+  return { kind: "github", type: "git", git: refs ? "refs" : "upload-pack",
+    target: upstream, repository: repository.join("/"), manifest: false, ping: false, ttl: 0 };
+}
+
 export function buildRoute(url: URL): Route | null {
+  const fullGit = url.pathname.match(/^\/https:\/\/github\.com(\/.*)$/i);
+  if (fullGit) {
+    const parts = pathParts(fullGit[1]);
+    return parts ? gitRoute(parts, url) : null;
+  }
   // Support a full Gist Raw URL after the proxy origin, but only this exact
   // HTTPS host. Do not turn embedded URLs into a general-purpose URL proxy.
   const fullGist = url.pathname.match(/^\/https:\/\/gist\.githubusercontent\.com(\/.*)$/i);
@@ -69,7 +92,7 @@ export function buildRoute(url: URL): Route | null {
     const parts = pathParts(fullGist[1]);
     if (!parts) return null;
     // Prefer the real upstream path, including the valid username "gist".
-    // Also accept the legacy form with an extra /gist/ before username/id/raw.
+    // Also accept an extra /gist/ before username/id/raw.
     return gistRoute(parts) ?? (parts[0] === "gist" ? gistRoute(parts.slice(1)) : null);
   }
   // Docker/OCI clients use /v2; /ghcr.io/v2 is a convenient HTTP alias.
@@ -80,6 +103,9 @@ export function buildRoute(url: URL): Route | null {
   }
   const parts = pathParts(pathname);
   if (!parts) return null;
+  if (parts[1]?.endsWith(".git") && ["info", "git-upload-pack"].includes(parts[2])) {
+    return gitRoute(parts, url);
+  }
   if (parts[0] === "v2") {
     const operation = parts.at(-2);
     const reference = parts.at(-1)!;

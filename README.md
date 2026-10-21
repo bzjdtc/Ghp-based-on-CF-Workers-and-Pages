@@ -1,6 +1,6 @@
 # GitHub / GHCR 下载代理
 
-Cloudflare Worker，支持 GitHub Release、Raw、源码归档、Gist Raw，以及 GHCR 公开和私有镜像、OCI 产物的只读下载。私有包使用拉取方自己的 GitHub 凭证。
+Cloudflare Worker，支持 GitHub Release、Raw、源码归档、Gist Raw、公开仓库的 Git HTTPS 克隆与拉取，以及 GHCR 公开和私有镜像、OCI 产物的只读下载。私有包使用拉取方自己的 GitHub 凭证。
 
 **默认所有下载都需要代理认证。** 可按类型配置免认证；代理密码与 GitHub PAT 分开使用。本文中的 `proxy.example.com`、`owner/repo`、`owner/image`、标签和文件名都是示例，请替换成自己的实际值。
 
@@ -9,6 +9,7 @@ Cloudflare Worker，支持 GitHub Release、Raw、源码归档、Gist Raw，以�
 - [拉取 GHCR 镜像](#拉取-ghcr-镜像)
 - [下载 OCI 产物及直接使用 HTTPS](#下载-oci-产物及直接使用-https)
 - [GitHub 文件下载](#github-文件下载)
+- [Git HTTPS 克隆与拉取](#git-https-克隆与拉取)
 - [本地开发与常用命令](#本地开发与常用命令)
 - [常见问题](#常见问题)
 - [上传 GitHub 与凭证保护](#上传-github-与凭证保护)
@@ -21,6 +22,8 @@ Cloudflare Worker，支持 GitHub Release、Raw、源码归档、Gist Raw，以�
 部署机器需要 Node.js 22 或更新版本及 npm。使用自定义域名需要自己的 Cloudflare 账号和该账号下已激活的域名区域；域名配置方式见 [Cloudflare Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)。下载镜像的客户端需要 Docker，下载普通 OCI 文件推荐使用 ORAS，HTTP 下载可使用 curl。
 
 下面标注 `powershell` 的命令用于 Windows PowerShell；标注 `bash` 的命令用于 Linux/macOS Bash，两种多行语法不能混用。Linux/macOS 的 curl 命令使用 `curl`，Windows 示例明确使用 `curl.exe`。
+
+Windows PowerShell 若提示禁止运行 `npm.ps1` 或 `npx.ps1`，将命令中的 `npm`、`npx` 分别改为 `npm.cmd`、`npx.cmd`，例如 `npm.cmd run deploy`。
 
 ### 1. 安装依赖并生成配置
 
@@ -153,7 +156,7 @@ curl.exe --fail "https://proxy.example.com/health"
 ```jsonc
 "vars": {
   "ALLOW_ANONYMOUS": "true",
-  "ANONYMOUS_ROUTES": "gist,raw,releases,archive,ghcr"
+  "ANONYMOUS_ROUTES": "gist,raw,releases,archive,ghcr,git"
 }
 ```
 
@@ -165,6 +168,7 @@ curl.exe --fail "https://proxy.example.com/health"
 | `raw` | GitHub Raw，含两种路径写法 |
 | `releases` | GitHub Release 附件 |
 | `archive` | 源码归档、zipball、tarball |
+| `git` | 公开 GitHub 仓库的 Git HTTPS 克隆与拉取 |
 | `ghcr` | GHCR `/v2/` 登录检查、镜像和 OCI manifests/blobs |
 
 默认 `ALLOW_ANONYMOUS="false"`、`ANONYMOUS_ROUTES` 为空。未豁免的类型需要 `PROXY_TOKEN`：服务端缺少 Secret 时返回 503，客户端缺少凭证或密码错误时返回 401。只有总开关为 `"true"` 且列表包含对应类型时才免认证；列表不支持通配符，缺失、为空或拼写错误的条目不会开放对应路由。配置免认证类型时可以保留代理 Secret，供其他类型使用。
@@ -445,9 +449,63 @@ https://proxy.example.com/https://gist.githubusercontent.com/gist/user/gist-id/r
 
 ### 范围请求与缓存
 
-支持 GET、HEAD、单段 `Range`、`If-Range` 和条件请求。客户端查询参数会被丢弃，不能用于绕过缓存，也不支持用查询参数向上游传递私有下载令牌。
+文件下载支持 GET、HEAD、单段 `Range`、`If-Range` 和条件请求。文件下载的客户端查询参数会被丢弃，不能用于绕过缓存，也不支持用查询参数向上游传递私有下载令牌。Git 协议的请求与查询参数规则见下节。
 
 只有未携带 GitHub 凭证、大小已知、未压缩、可公开缓存且不超过 1 MiB 的完整 200 响应会写入内部 Cache API；实际读取也有大小上限。GHCR 公开标签清单缓存 60 秒，其余符合条件的响应缓存一小时，清单的缓存键区分规范化后的 Accept 类型。较大或长度未知的内容直接流式传输，客户端断开后不会有后台缓存副本继续下载整个文件。对客户端始终返回 `private, no-store`，防止共享缓存绕过代理鉴权。
+
+## Git HTTPS 克隆与拉取
+
+支持公开 GitHub 仓库的 `git clone`、`git fetch`、`git pull` 和 `git ls-remote`，采用 [Git Smart HTTP 协议](https://git-scm.com/docs/gitprotocol-http)。不支持 SSH、`git://`、推送、Git LFS 或私有 GitHub 仓库；GitHub PAT 功能用于 GHCR，不转发到 Git 仓库。
+
+### 免认证配置
+
+Git 使用独立的 `git` 类型。在本地配置中开启总开关，并把 `git` 加入免认证列表；保留需要开放的其他类型。例如只开放 Git 和 Gist：
+
+```jsonc
+"vars": {
+  "ALLOW_ANONYMOUS": "true",
+  "ANONYMOUS_ROUTES": "git,gist"
+}
+```
+
+修改后执行 `npm run deploy`。
+
+### 克隆与更新
+
+安装 Git 后，在客户端执行。以下两种地址等价，`.git` 后缀必须保留：
+
+```powershell
+git clone "https://proxy.example.com/https://github.com/owner/repo.git"
+```
+
+```powershell
+git clone "https://proxy.example.com/owner/repo.git"
+```
+
+通过代理克隆后，`origin` 已指向代理，可直接更新：
+
+```powershell
+git -C repo pull --ff-only
+```
+
+已有本地仓库时，只修改该仓库的远端地址，然后拉取：
+
+```powershell
+git -C repo remote set-url origin "https://proxy.example.com/https://github.com/owner/repo.git"
+git -C repo fetch origin
+```
+
+支持 Git 协议版本 0、1、2，以及 `--depth 1`、`--filter=blob:none` 等上游支持的拉取选项。源码压缩包使用归档下载路径。
+
+若未开放 `git` 免认证，可使用 `https://proxy@proxy.example.com/owner/repo.git`，提示密码时输入 `PROXY_TOKEN`，也可使用自己的 Git 凭证管理器。不要把密码写进 URL。
+
+### 协议与资源限制
+
+仅转发 `GET/HEAD /owner/repo.git/info/refs?service=git-upload-pack` 和 `POST /owner/repo.git/git-upload-pack`。引用查询必须只有这一项固定参数，POST 不接受查询参数；`git-receive-pack` 推送接口被拒绝。
+
+POST 只接受 Git 协商格式，支持未压缩或 gzip 编码，请求体上限 1 MiB（gzip 按传输大小计算），读取最多等待 15 秒；超限返回 413，超时返回 408。Git 响应直接流式返回，不进入共享缓存。克隆通常包含多次 HTTP 请求，每次都执行认证策略、白名单和限流。
+
+Git 与文件下载共用 `ALLOWED_GITHUB_REPOSITORIES`，白名单填写 `owner/repo`，不带 `.git`。重定向仅限 `github.com` 的同一仓库与同一读取接口，仓库重命名后应改用最新地址。子模块需分别设置代理地址，并满足对应白名单。
 
 ## 本地开发与常用命令
 
@@ -502,7 +560,7 @@ npm test
 npm run deploy -- --dry-run
 ```
 
-`npm test` 使用 Wrangler 自带的 workerd/Miniflare 运行 Worker，并模拟上游网络。测试覆盖公开/私有 GHCR 认证、OCI 下载、用户与缓存隔离、权限撤销、Blob 重定向、各类型免认证、白名单、限流、范围请求和路径校验。真实服务的端到端验证需要使用自己的包和客户端。
+`npm test` 使用 Wrangler 自带的 workerd/Miniflare 运行 Worker，并模拟上游网络。测试覆盖公开/私有 GHCR 认证、OCI 下载、Git 协商与推送拦截、用户与缓存隔离、权限撤销、Blob 重定向、各类型免认证、白名单、限流、范围请求和路径校验。真实服务的端到端验证需要使用自己的包和客户端。
 
 ## 常见问题
 

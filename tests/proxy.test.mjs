@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 
 // Exercise the real workerd runtime using the tools shipped with Wrangler.
 const require = createRequire(import.meta.url);
@@ -36,6 +37,7 @@ function fixture(options = {}) {
     async outboundService(request) {
         const entry = { url: request.url, method: request.method,
           headers: Object.fromEntries(request.headers) };
+        if (options.captureBody && request.body) entry.body = Buffer.from(await request.arrayBuffer());
         requests.push(entry);
         if (options.upstream) return options.upstream(request, requests);
         return new MockResponse("hello", { headers: {
@@ -79,7 +81,7 @@ test("download routing, authorization, and cache behavior in workerd", async t =
     assert.equal(f.requests.length, before);
   });
 
-  await t.test("existing GitHub routes preserve safe encoded filenames and omit credentials", async () => {
+  await t.test("GitHub routes preserve safe encoded filenames and omit credentials", async () => {
     const paths = new Map([
       ["/owner/repo/releases/download/v1/file%23%3F%20x.zip?random=1", "https://github.com/owner/repo/releases/download/v1/file%23%3F%20x.zip"],
       ["/raw/owner/repo/main/file.txt", "https://raw.githubusercontent.com/owner/repo/main/file.txt"],
@@ -149,6 +151,7 @@ test("anonymous route selection is exact and controlled by the master switch", a
     raw: ["/raw/owner/repo/main/file.txt", "/owner/repo/raw/main/file.txt"],
     releases: ["/owner/repo/releases/download/v1/file.zip"],
     archive: ["/owner/repo/archive/refs/heads/main.zip", "/owner/repo/zipball/main", "/owner/repo/tarball/main"],
+    git: ["/owner/repo.git/info/refs?service=git-upload-pack", "/https://github.com/owner/repo.git/info/refs?service=git-upload-pack"],
     ghcr: ["/v2/", "/ghcr.io/v2/", "/v2/owner/image/manifests/latest", `/v2/owner/image/blobs/${digest}`],
   };
   for (const selected of Object.keys(types)) {
@@ -276,7 +279,7 @@ test("Gist Raw downloads are public while other downloads stay protected", async
       assert.equal(f.requests.length, 1);
     } finally { await f.mf.dispose(); }
   });
-  await t.test("full Gist URLs and the extra /gist/ legacy form share public cache entries", async () => {
+    await t.test("full Gist URLs and the extra /gist/ form share public cache entries", async () => {
     const f = fixture();
     try {
       for (const path of ["/gist/user/abc123/raw/file.txt",
@@ -704,6 +707,178 @@ test("private authorization failures never fall back to anonymous access or shar
   allowed = true;
   assert.equal(await (await f.fetch(privatePath, { headers: privateHeaders() })).text(), "private bytes");
   assert.equal((await f.fetch(privatePath)).status, 403, "another proxy user cannot read private bytes anonymously");
+});
+
+test("Git Smart HTTP cloning is read-only, bounded, and isolated from caches", async t => {
+  const refs = "/https://github.com/owner/repo.git/info/refs?service=git-upload-pack";
+  const rpc = "/https://github.com/owner/repo.git/git-upload-pack";
+  const headers = { "Content-Type": "application/x-git-upload-pack-request", "Git-Protocol": "version=2" };
+  const packet = Buffer.from("0014command=ls-refs\n00010000\0binary");
+
+  await t.test("both URL formats relay discovery and binary/gzip negotiation without credentials or caches", async () => {
+    const responseBytes = Buffer.from([0, 255, 1, 128, 10]);
+    const f = fixture({ bindings: { PROXY_TOKEN: "", ANONYMOUS_ROUTES: "git" }, captureBody: true,
+      upstream(request) {
+        return new MockResponse(responseBytes, { headers: {
+          "Content-Type": request.method === "POST" ? "application/x-git-upload-pack-result"
+            : "application/x-git-upload-pack-advertisement",
+          "Content-Length": String(responseBytes.length), "Cache-Control": "public, max-age=3600",
+        } });
+      } });
+    try {
+      for (const path of [refs, "/owner/repo.git/info/refs?service=git-upload-pack"]) {
+        const response = await f.fetch(path, { headers: {
+          Authorization: basic("private-user", "do-not-forward"), Cookie: "session=client", "Git-Protocol": "version=2",
+        } });
+        assert.equal(response.status, 200);
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), responseBytes);
+        assert.equal(response.headers.get("Content-Type"), "application/x-git-upload-pack-advertisement");
+        assert.equal(response.headers.get("Set-Cookie"), null);
+        assert.equal(response.headers.get("Cache-Control"), "private, no-store");
+        assert.equal(f.requests.at(-1).url, "https://github.com/owner/repo.git/info/refs?service=git-upload-pack");
+        assert.equal(f.requests.at(-1).method, "GET");
+      }
+      for (const encoding of [undefined, "gzip"]) {
+        const body = encoding ? gzipSync(packet) : packet;
+        const response = await f.fetch(encoding ? rpc : "/owner/repo.git/git-upload-pack", { method: "POST", body,
+          headers: { ...headers, ...(encoding ? { "Content-Encoding": encoding } : {}), Cookie: "client=secret" } });
+        assert.equal(response.status, 200);
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), responseBytes);
+        assert.equal(response.headers.get("Content-Type"), "application/x-git-upload-pack-result");
+        const upstream = f.requests.at(-1);
+        assert.equal(upstream.url, "https://github.com/owner/repo.git/git-upload-pack");
+        assert.equal(upstream.method, "POST");
+        assert.equal(upstream.headers["content-type"], headers["Content-Type"]);
+        assert.equal(upstream.headers["content-encoding"], encoding);
+        assert.deepEqual(upstream.body, body);
+      }
+      assert.equal(f.requests.length, 4, "every negotiation reaches GitHub despite public upstream cache headers");
+      for (const request of f.requests) {
+        assert.equal(request.headers["git-protocol"], "version=2");
+        assert.equal(request.headers.authorization, undefined);
+        assert.equal(request.headers.cookie, undefined);
+        assert.equal(request.headers["x-ghcr-authorization"], undefined);
+      }
+      const preflight = await f.fetch(rpc, { method: "OPTIONS" });
+      assert.match(preflight.headers.get("Access-Control-Allow-Methods"), /POST/);
+      assert.match(preflight.headers.get("Access-Control-Allow-Headers"), /Git-Protocol/);
+    } finally { await f.mf.dispose(); }
+  });
+
+  await t.test("proxy authentication and the master switch protect discovery and POST alike", async () => {
+    for (const bindings of [{ ANONYMOUS_ROUTES: "raw" }, { ANONYMOUS_ROUTES: "git", ALLOW_ANONYMOUS: "false" }]) {
+      const f = fixture({ bindings });
+      try {
+        for (const Authorization of ["", "Bearer wrong"]) {
+          assert.equal((await f.fetch(refs, { headers: { Authorization } })).status, 401);
+          assert.equal((await f.fetch(rpc, { method: "POST", body: packet, headers: { ...headers, Authorization } })).status, 401);
+        }
+        assert.equal(f.requests.length, 0);
+        assert.equal((await f.fetch(refs, { headers: { Authorization: basic("proxy", secret) } })).status, 200);
+        assert.equal((await f.fetch(rpc, { method: "POST", body: packet, headers })).status, 200);
+        assert.ok(f.requests.every(request => !request.headers.authorization));
+      } finally { await f.mf.dispose(); }
+    }
+  });
+
+  await t.test("only the two download endpoints, their methods, and exact service parameter are accepted", async () => {
+    const f = fixture({ bindings: { ANONYMOUS_ROUTES: "git" } });
+    try {
+      for (const path of [
+        "/https://github.com/owner/repo.git/info/refs", refs + "&nonce=1", refs + "&service=git-upload-pack",
+        refs.replace("git-upload-pack", "git-receive-pack"), rpc + "?service=git-upload-pack",
+        "/https://github.com/owner/repo.git/git-receive-pack", "/owner/repo.git/git-receive-pack",
+        "/https://github.com/owner/repo.git/objects/info/packs",
+        "/https://github.com.evil.test/owner/repo.git/info/refs?service=git-upload-pack",
+        "/https://github.com@evil.test/owner/repo.git/info/refs?service=git-upload-pack",
+        "/https://user:pass@github.com/owner/repo.git/info/refs?service=git-upload-pack",
+        "/https://github.com:444/owner/repo.git/info/refs?service=git-upload-pack",
+        "/http://github.com/owner/repo.git/info/refs?service=git-upload-pack",
+        "/https://github.com/owner/repo.git%2fextra/info/refs?service=git-upload-pack",
+        "/https://github.com/owner/%2e%2egit/info/refs?service=git-upload-pack",
+        "/https://github.com/owner/repo/archive/refs/heads/main.zip",
+      ]) assert.equal((await f.fetch(path)).status, 404, path);
+      for (const [path, method] of [[rpc, "GET"], [rpc, "HEAD"], [rpc, "PUT"], [refs, "POST"],
+        ["/raw/owner/repo/main/file", "POST"], [rpc.replace("git-upload-pack", "git-receive-pack"), "POST"]]) {
+        assert.equal((await f.fetch(path, { method, ...(method === "POST" || method === "PUT" ? { body: packet } : {}), headers })).status, 405);
+      }
+      assert.equal(f.requests.length, 0);
+    } finally { await f.mf.dispose(); }
+  });
+
+  await t.test("invalid negotiation headers and empty/oversized bodies are rejected before contacting GitHub", async () => {
+    const f = fixture({ bindings: { ANONYMOUS_ROUTES: "git" } });
+    try {
+      assert.equal((await f.fetch(refs, { headers: { "Git-Protocol": "version=2:untrusted=value" } })).status, 400);
+      for (const invalid of [{ "Content-Type": "text/plain" }, { "Content-Encoding": "br" }]) {
+        assert.equal((await f.fetch(rpc, { method: "POST", body: packet, headers: { ...headers, ...invalid } })).status, 415);
+      }
+      assert.equal((await f.fetch(rpc, { method: "POST", headers })).status, 400);
+      const oversized = Buffer.alloc(1024 * 1024 + 1, 120);
+      assert.equal((await f.fetch(rpc, { method: "POST", headers, body: oversized })).status, 413);
+      assert.equal((await f.fetch(rpc, { method: "POST", headers, duplex: "half", body: new ReadableStream({
+        start(controller) { controller.enqueue(oversized); controller.close(); },
+      }) })).status, 413, "chunked requests without Content-Length have the same bound");
+      assert.equal(f.requests.length, 0);
+      assert.equal((await f.fetch(rpc, { method: "POST", headers, body: oversized.subarray(0, 1024 * 1024) })).status, 200);
+    } finally { await f.mf.dispose(); }
+  });
+
+  await t.test("Git repository allowlists and quotas cover discovery and POST", async () => {
+    const f = fixture({ bindings: { ANONYMOUS_ROUTES: "git", ALLOWED_GITHUB_REPOSITORIES: "OWNER/allowed" }, ratelimits: {
+      IP_RATE_LIMITER: { namespace_id: "1", simple: { limit: 100, period: 60 } },
+      TOTAL_RATE_LIMITER: { namespace_id: "2", simple: { limit: 1, period: 60 } },
+    } });
+    try {
+      assert.equal((await f.fetch(refs)).status, 403);
+      assert.equal((await f.fetch(rpc, { method: "POST", body: packet, headers })).status, 403);
+      assert.equal(f.requests.length, 0);
+      assert.equal((await f.fetch(refs.replace("repo.git", "allowed.git"))).status, 200);
+      assert.equal((await f.fetch(rpc.replace("repo.git", "allowed.git"), { method: "POST", body: packet, headers })).status, 429);
+      assert.equal(f.requests.length, 1);
+    } finally { await f.mf.dispose(); }
+  });
+
+  await t.test("Git redirects cannot change repositories, services, hosts, or POST semantics", async () => {
+    for (const location of ["https://github.com/owner/repo.git/git-receive-pack",
+      "https://github.com/owner/other.git/info/refs?service=git-upload-pack", "https://github.com/owner/repo/archive/main.zip",
+      "https://codeload.github.com/owner/repo.git/info/refs?service=git-upload-pack",
+      "https://evil.test/owner/repo.git/info/refs?service=git-upload-pack"]) {
+      const f = fixture({ upstream: () => new MockResponse(null, { status: 307, headers: { Location: location } }) });
+      try {
+        assert.equal((await f.fetch(refs)).status, 502, location);
+        assert.equal(f.requests.length, 1);
+      } finally { await f.mf.dispose(); }
+    }
+    for (const status of [301, 302, 303, 307, 308]) {
+      const f = fixture({ captureBody: true, upstream(request, requests) {
+        return requests.length === 1 ? new MockResponse(null, { status, headers: {
+          Location: "https://github.com/OWNER/repo.git/git-upload-pack",
+        } }) : new MockResponse("pack");
+      } });
+      try {
+        const response = await f.fetch(rpc, { method: "POST", body: packet, headers });
+        assert.equal(response.status, status >= 307 ? 200 : 502);
+        if (status >= 307) {
+          assert.equal(await response.text(), "pack");
+          assert.deepEqual(f.requests[1].body, packet);
+          assert.equal(f.requests[1].method, "POST");
+        }
+      } finally { await f.mf.dispose(); }
+    }
+  });
+
+  await t.test("private GitHub repositories return access denied without a misleading proxy challenge", async () => {
+    const f = fixture({ bindings: { ANONYMOUS_ROUTES: "git" }, upstream: () => new MockResponse(null, {
+      status: 401, headers: { "WWW-Authenticate": "Basic realm=GitHub" },
+    }) });
+    try {
+      const response = await f.fetch(refs, { headers: { Authorization: "" } });
+      assert.equal(response.status, 403);
+      assert.equal(response.headers.get("WWW-Authenticate"), null);
+      assert.match(await response.text(), /private or unavailable/);
+    } finally { await f.mf.dispose(); }
+  });
 });
 
 test("private credentials respect anonymous configuration, allowlists, and resource limits", async t => {

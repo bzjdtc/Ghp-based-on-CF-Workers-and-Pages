@@ -13,10 +13,11 @@ interface Env {
 }
 
 const MAX_CACHE_BYTES = 1024 * 1024;
+const MAX_GIT_REQUEST_BYTES = 1024 * 1024;
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-  "Access-Control-Allow-Headers": "Range, If-Range, Authorization, X-GHCR-Authorization, Content-Type, Accept, If-None-Match, If-Modified-Since",
+  "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Range, If-Range, Authorization, X-GHCR-Authorization, Content-Type, Content-Encoding, Git-Protocol, Accept, If-None-Match, If-Modified-Since",
   "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified, Docker-Content-Digest, Docker-Distribution-Api-Version, WWW-Authenticate, Retry-After",
 };
 
@@ -37,15 +38,17 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    return jsonResponse({ error: "Method not allowed" }, 405, { Allow: "GET, HEAD, OPTIONS" });
+  if (url.href.length > 8192) return jsonResponse({ error: "URL too long" }, 414);
+  const route = buildRoute(url);
+  const methods = route?.git === "upload-pack" ? ["POST", "OPTIONS"] : ["GET", "HEAD", "OPTIONS"];
+  if (!methods.includes(request.method)) {
+    return jsonResponse({ error: "Method not allowed" }, 405, { Allow: methods.join(", ") });
   }
   if (url.pathname === "/" || url.pathname === "/health") {
     return new Response(request.method === "HEAD" ? null : "GitHub / GHCR Proxy OK\n", {
       headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
     });
   }
-  if (url.href.length > 8192) return jsonResponse({ error: "URL too long" }, 414);
   if (!env.IP_RATE_LIMITER || !env.TOTAL_RATE_LIMITER) {
     return jsonResponse({ error: "Proxy rate limit bindings are not configured" }, 503);
   }
@@ -54,7 +57,6 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   });
   if (!success) return rateLimited();
 
-  const route = buildRoute(url);
   // Only validated route types can opt out of proxy authentication. Both the
   // switch and an exact list entry are required; missing settings fail closed.
   const anonymous = !!route && env.ALLOW_ANONYMOUS === "true" &&
@@ -82,6 +84,27 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   }
   const total = await env.TOTAL_RATE_LIMITER.limit({ key: "all-downloads" });
   if (!total.success) return rateLimited();
+  if (route.git) {
+    const protocol = request.headers.get("Git-Protocol");
+    if (protocol !== null && !/^version=[012]$/.test(protocol)) {
+      return jsonResponse({ error: "Unsupported Git-Protocol version" }, 400);
+    }
+    let body: Uint8Array<ArrayBuffer> | undefined;
+    if (route.git === "upload-pack") {
+      const mediaType = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+      const encoding = request.headers.get("Content-Encoding")?.toLowerCase();
+      if (mediaType !== "application/x-git-upload-pack-request" ||
+        encoding && !["identity", "gzip"].includes(encoding)) {
+        return jsonResponse({ error: "Unsupported Git request content type or encoding" }, 415);
+      }
+      const result = await gitRequestBody(request);
+      if (result instanceof Response) return result;
+      body = result;
+    }
+    // Negotiation and pack responses are never read from or written to Cache
+    // API. The bounded POST body can be replayed only on safe Git redirects.
+    return clientResponse(await fetchUpstream(route, request, undefined, body), request, route);
+  }
   if (route.ping && !access.ghcrAuthorization) {
     return new Response(request.method === "HEAD" ? null : "{}", {
       headers: { ...CORS_HEADERS, "Docker-Distribution-Api-Version": "registry/2.0",
@@ -122,6 +145,41 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     return clientResponse(result, request, route);
   }
   return clientResponse(response, request, route);
+}
+
+async function gitRequestBody(request: Request): Promise<Uint8Array<ArrayBuffer> | Response> {
+  const length = request.headers.get("Content-Length");
+  if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_GIT_REQUEST_BYTES)) {
+    return jsonResponse({ error: "Git request body exceeds 1 MiB" }, 413);
+  }
+  if (!request.body) return jsonResponse({ error: "Empty Git request body" }, 400);
+  const reader = request.body.getReader();
+  const bytes = new Uint8Array(MAX_GIT_REQUEST_BYTES);
+  let size = 0;
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    void reader.cancel().catch(() => {});
+  }, 15_000);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (timedOut) return jsonResponse({ error: "Git request body timed out" }, 408);
+      if (done) break;
+      if (size + value.byteLength > MAX_GIT_REQUEST_BYTES) {
+        await reader.cancel();
+        return jsonResponse({ error: "Git request body exceeds 1 MiB" }, 413);
+      }
+      bytes.set(value, size);
+      size += value.byteLength;
+    }
+    return size ? bytes.subarray(0, size) : jsonResponse({ error: "Empty Git request body" }, 400);
+  } catch {
+    return jsonResponse({ error: timedOut ? "Git request body timed out" : "Invalid Git request body" }, timedOut ? 408 : 400);
+  } finally {
+    clearTimeout(timeout);
+    reader.releaseLock();
+  }
 }
 
 function cacheKey(origin: string, route: Route, request: Request): Request {

@@ -14,9 +14,10 @@
 
 ## 回源与凭证边界
 
-- 下载仅支持 GET 和 HEAD，并提供 OPTIONS 预检。回源目标限定为支持的 GitHub 文件和 GHCR manifests/blobs 接口，不提供任意 URL 代理、上传、删除、目录或标签列表。
+- 文件下载仅支持 GET 和 HEAD，并提供 OPTIONS 预检。Git Smart HTTP 额外允许向固定 `git-upload-pack` 接口发送 POST，用于读取公开仓库；不开放 `git-receive-pack` 推送。回源目标限定为支持的 GitHub 文件、Git 读取和 GHCR manifests/blobs 接口，不提供任意 URL 代理、上传、删除、目录或标签列表。
 - 路径逐段解码、校验并重新编码，拒绝路径穿越、编码后的分隔符、控制字符和无效组件。重定向逐跳检查，只接受固定 HTTPS 域名，拒绝用户信息和自定义端口，最多三跳；跨域时删除 Authorization。
 - Gist 回源与重定向限定为 `gist.githubusercontent.com`。GHCR 回源与镜像层跳转限定为 `ghcr.io` 和 `pkg-containers.githubusercontent.com`。完整 Gist URL 的不同入口使用相同的路径校验、白名单和缓存规则。
+- Git 回源与重定向只接受 `github.com` 的同一仓库、同一读取接口，POST 仅跟随保持方法的 307/308。引用查询仅接受固定 `service=git-upload-pack` 参数，POST 不接受查询参数；仅转发已校验的 Git 协议版本、固定内容类型和受限编码，不转发客户端 Authorization、Cookie 或 GitHub PAT。私有 Git 仓库不受支持。
 - GHCR 令牌接口固定为 `https://ghcr.io/token`，service 固定为 `ghcr.io`，scope 由已校验的仓库名构造且只有 `pull`。不信任客户端或认证 challenge 提供的 realm、service、scope。
 - 代理密码与 GitHub 身份分别验证。受保护的 GHCR 路由使用 `GitHub用户名` 和 `代理密码:GitHub_PAT`，HTTP 客户端也可使用代理 Bearer 与独立的 `X-GHCR-Authorization: Basic ...`。代理密码本身不授予私有包权限。
 - 开放 `ghcr` 免代理认证后，私有包需要有效的 GitHub 凭证，可使用原生 GitHub Basic 登录或 `X-GHCR-Authorization`。配置了 `PROXY_TOKEN` 时也支持复合密码。登录校验凭证，具体包的读取权限在请求仓库时校验；GHCR 拒绝认证或访问时返回 403。
@@ -32,7 +33,8 @@ GHCR 公开包支持上游匿名读取，代理入口是否要求代理密码由
 | --- | --- |
 | 请求限流 | 默认每 IP 每分钟 120 次，每个 Cloudflare 节点合计每分钟 600 次有效下载请求；缓存命中同样计数，超限返回 429。缺少任一限流绑定时拒绝下载 |
 | 缓存体积 | 仅缓存大小已知、未压缩、可公开缓存且不超过 1 MiB 的完整 200 响应；实际读取有大小上限。较大、长度未知、私有或带 Cookie 的响应直接流式传输 |
-| 缓存键 | 丢弃客户端查询参数，按实际上游地址统一入口别名；GHCR Accept 类型规范化，限制缓存变体 |
+| 缓存键 | 文件下载丢弃客户端查询参数，按实际上游地址统一入口别名；GHCR Accept 类型规范化，限制缓存变体。Git 请求完全跳过共享缓存 |
+| Git 请求体 | 协商 POST 上限 1 MiB，按实际读取量检查，不信任 Content-Length；gzip 不在 Worker 解压，按传输大小限额。读取最多等待 15 秒；响应包直接流式返回 |
 | 客户端缓存 | 下载响应使用 `private, no-store`。内部 Cache API 访问前执行认证策略、白名单和限流检查 |
 | 范围请求 | 仅接受单段 Range，支持断点续传；拒绝多段或无效 Range |
 | 上游等待 | 每次等待上游响应头最多 15 秒；大型响应体以流式方式返回，不创建后台缓存副本持续下载整个文件 |

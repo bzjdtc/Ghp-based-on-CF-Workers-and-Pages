@@ -1,4 +1,4 @@
-import { manifestAccept, type Route } from "./routes";
+import { buildRoute, manifestAccept, type Route } from "./routes";
 
 const GITHUB_HOSTS = new Set([
   "github.com", "raw.githubusercontent.com", "gist.githubusercontent.com",
@@ -7,6 +7,7 @@ const GITHUB_HOSTS = new Set([
 ]);
 const GHCR_HOSTS = new Set(["ghcr.io", "pkg-containers.githubusercontent.com"]);
 const GIST_HOSTS = new Set(["gist.githubusercontent.com"]);
+const GIT_HOSTS = new Set(["github.com"]);
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 3;
 const HEADER_TIMEOUT_MS = 15_000;
@@ -20,12 +21,12 @@ export class UpstreamError extends Error {
 
 // Time out waiting for headers, while leaving large response bodies streaming.
 async function fetchHeaders(url: URL, method: string, headers: Headers,
-  signal: AbortSignal): Promise<Response> {
+  signal: AbortSignal, body?: Uint8Array<ArrayBuffer>, noStore = false): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), HEADER_TIMEOUT_MS);
   try {
     return await fetch(url.toString(), {
-      method, headers, redirect: "manual",
+      method, headers, body, redirect: "manual", cache: noStore ? "no-store" : undefined,
       signal: AbortSignal.any([signal, controller.signal]),
     });
   } catch {
@@ -36,9 +37,9 @@ async function fetchHeaders(url: URL, method: string, headers: Headers,
 }
 
 async function fetchRedirects(route: Route, request: Request,
-  headers: Headers): Promise<Response> {
+  headers: Headers, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
   let url = route.target;
-  const allowed = route.kind === "ghcr" ? GHCR_HOSTS
+  const allowed = route.git ? GIT_HOSTS : route.kind === "ghcr" ? GHCR_HOSTS
     : route.target.hostname === "gist.githubusercontent.com" ? GIST_HOSTS : GITHUB_HOSTS;
   const forwarded = new Headers(headers);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
@@ -46,10 +47,19 @@ async function fetchRedirects(route: Route, request: Request,
       url.port || !allowed.has(url.hostname)) {
       throw new UpstreamError("Blocked upstream redirect");
     }
-    const response = await fetchHeaders(url, request.method, forwarded, request.signal);
+    if (route.git) {
+      const redirect = buildRoute(url);
+      if (redirect?.git !== route.git || redirect.repository.toLowerCase() !== route.repository.toLowerCase()) {
+        throw new UpstreamError("Blocked Git upstream redirect");
+      }
+    }
+    const response = await fetchHeaders(url, request.method, forwarded, request.signal, body, !!route.git);
     if (!REDIRECTS.has(response.status)) return response;
     const location = response.headers.get("Location");
     await response.body?.cancel();
+    if (body && response.status !== 307 && response.status !== 308) {
+      throw new UpstreamError("Blocked Git POST redirect");
+    }
     if (!location || redirects === MAX_REDIRECTS) {
       throw new UpstreamError("Invalid or excessive upstream redirects");
     }
@@ -123,8 +133,25 @@ async function registryToken(repository: string, signal: AbortSignal,
 }
 
 export async function fetchUpstream(route: Route, request: Request,
-  ghcrAuthorization?: string): Promise<Response> {
+  ghcrAuthorization?: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
   const headers = new Headers({ "User-Agent": "Personal-GitHub-Proxy/2.0" });
+  if (route.git) {
+    headers.set("Accept", route.git === "refs" ? "application/x-git-upload-pack-advertisement"
+      : "application/x-git-upload-pack-result");
+    const protocol = request.headers.get("Git-Protocol");
+    if (protocol) headers.set("Git-Protocol", protocol);
+    if (body) {
+      headers.set("Content-Type", "application/x-git-upload-pack-request");
+      const encoding = request.headers.get("Content-Encoding");
+      if (encoding) headers.set("Content-Encoding", encoding);
+    }
+    const response = await fetchRedirects(route, request, headers, body);
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel();
+      throw new UpstreamError("GitHub repository is private or unavailable", 403);
+    }
+    return response;
+  }
   for (const name of ["Range", "If-Range", "If-None-Match", "If-Modified-Since"]) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);

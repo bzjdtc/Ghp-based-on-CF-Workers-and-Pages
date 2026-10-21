@@ -35,7 +35,7 @@ npx wrangler deploy --config wrangler.local.jsonc --dry-run
 | `ratelimits[].namespace_id` | 两个独立的数字编号；账号内避免与其他 Worker 共用 |
 | `ratelimits[].simple.limit` | 默认每 IP 120 次/60 秒、每节点合计 600 次/60 秒 |
 | `vars.ALLOW_ANONYMOUS` | 默认字符串 `"false"`，全部下载都需要代理认证；`"true"` 开启选定类型免认证 |
-| `vars.ANONYMOUS_ROUTES` | 逗号分隔的 `gist`、`raw`、`releases`、`archive`、`ghcr`；默认空字符串，不豁免任何类型 |
+| `vars.ANONYMOUS_ROUTES` | 逗号分隔的 `gist`、`raw`、`releases`、`archive`、`ghcr`、`git`；默认空字符串，不豁免任何类型 |
 | `vars.ALLOWED_GITHUB_REPOSITORIES` | 可选，精确的 `owner/repo` 或 Gist `user/gist-id` 列表 |
 | `vars.ALLOWED_GHCR_REPOSITORIES` | 可选，精确的 `owner/image` 列表，支持嵌套路径 |
 
@@ -59,7 +59,9 @@ npx wrangler deploy --config wrangler.local.jsonc --dry-run
 }
 ```
 
-若确需开放全部类型，开启总开关并填写 `gist,raw,releases,archive,ghcr`；不支持 `*`。缺少开关或列表时不豁免任何下载。对未豁免的类型，未配置 `PROXY_TOKEN` 返回 503，缺少/错误的客户端密码返回 401。健康检查 `/`、`/health` 和 OPTIONS 不受下载认证开关控制。
+若确需开放全部类型，开启总开关并填写 `gist,raw,releases,archive,ghcr,git`；不支持 `*`。缺少开关或列表时不豁免任何下载。对未豁免的类型，未配置 `PROXY_TOKEN` 返回 503，缺少/错误的客户端密码返回 401。健康检查 `/`、`/health` 和 OPTIONS 不受下载认证开关控制。
+
+`git` 控制公开 GitHub 仓库的 Git HTTPS 克隆与拉取。Git 与文件下载共用 `ALLOWED_GITHUB_REPOSITORIES`，填写 `owner/repo`，不带 `.git`。免认证列表中的 `raw` 或 `archive` 不会自动开放 Git；推送、SSH、Git LFS 和私有 Git 仓库不受支持。完整使用方法见 [README.md](README.md#git-https-克隆与拉取)。
 
 开放 `ghcr` 免代理认证后，公开包可匿名下载；私有包需要 GitHub 用户名/PAT，可使用 Basic 登录或 `X-GHCR-Authorization` 请求头。配置了 `PROXY_TOKEN` 时也支持 `代理密码:PAT` 复合密码。携带 GitHub 凭证的请求逐次验证权限并跳过共享缓存。
 
