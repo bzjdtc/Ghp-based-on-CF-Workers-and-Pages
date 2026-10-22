@@ -217,6 +217,10 @@ Docker 登录在**需要下载镜像的机器**上执行，不要求进入本项
 | 已开放 `ghcr` 免认证 | 公开包 | 无需登录 | 无需密码 |
 | 已开放 `ghcr` 免认证 | 私有包 | 真实 GitHub 用户名 | GitHub PAT；配置了 `PROXY_TOKEN` 时也支持 `代理密码:PAT` |
 
+`proxy` 只是仅拉取公开镜像时的示例用户名，不是固定账号；私有镜像需要使用真实 GitHub 用户名。
+
+**同时拉取公开和私有镜像时，按私有包方式登录一次即可，这份登录也能用于公开镜像。** GHCR 未开启免代理认证时，使用真实 GitHub 用户名，密码填写 `PROXY_TOKEN:GHCR_PAT`；已开启免代理认证时按表格填写 GitHub PAT。同一个 Docker 客户端配置中，再次登录同一代理域名会替换该域名保存的凭证，无需再单独以 `proxy` 登录。
+
 ### 公开镜像
 
 把原始镜像地址 `ghcr.io/owner/image:tag` 中的域名换为代理域名：
@@ -228,7 +232,7 @@ docker pull proxy.example.com/owner/image:tag
 docker pull "proxy.example.com/owner/image@sha256:<64位十六进制摘要>"
 ```
 
-以上为公开包下载方式：用户名可任意填写，密码为代理密钥。代理使用匿名 `pull` 令牌，最多在内存缓存 128 个仓库的短期令牌，并跟随经过校验的镜像层重定向。代理密码不会发送到任何上游，GHCR 令牌不会返回给客户端。
+以上为要求代理认证时的公开包下载方式：用户名可任意填写，密码为代理密钥。代理使用匿名 `pull` 权限，并跟随经过校验的镜像层重定向。代理密码不会发送到上游，客户端获得的 Registry 令牌不包含代理密码或 GitHub PAT。
 
 如果已开启总开关且列表中包含 `ghcr`，公开镜像可以直接执行 `docker pull`。本项目不是所有容器仓库的通用镜像源，只代理 GHCR；不需要把它配置成 Docker Hub 的 `registry-mirrors`。
 
@@ -271,11 +275,15 @@ Bash 交互登录示例：
   --username $env:GHCR_USERNAME --password-stdin
 ```
 
-无需在 Worker 配置统一的 GitHub PAT。代理先校验代理密钥，再将该客户端的 GitHub 用户名/PAT 通过 Basic 认证发送到固定的 `https://ghcr.io/token`，请求目标仓库的 `pull` 令牌；实际清单和层文件请求只携带兑换得到的 Bearer 令牌。PAT 不会发送到镜像层 CDN、GitHub 文件下载域名或返回给客户端。
+无需在 Worker 配置统一的 GitHub PAT。受保护的入口先校验代理密钥，再将客户端的 GitHub 用户名/PAT 通过 Basic 认证发送到固定的 `https://ghcr.io/token`。登录时校验凭证，拉取时请求目标仓库的 `pull` 令牌；实际清单和层文件请求只携带兑换得到的 Bearer 令牌。PAT 不会发送到镜像层 CDN、GitHub 文件下载域名或返回给客户端。
 
 代理 Worker 会接收客户端提供的 PAT，使用私有包功能时需要信任该部署及其管理者。
 
-带 GitHub 凭证的请求**每次重新兑换令牌，并完全绕过代理内部 Cache API 的读取和写入**；私有令牌不会存入共享令牌缓存。不同用户的权限不会互相借用，失败时也不会退回匿名访问或使用已有公开缓存。代价是每个私有清单/Blob 请求都增加一次 GHCR 令牌请求，仍受相同限流保护。登录会验证 GitHub 凭证，具体仓库的读取权限在拉取时验证。
+Docker/ORAS 先从 `/v2/` 收到 `401` 和 Bearer 认证挑战，再向同一代理域名的 `/__registry/token` 申请令牌。只有已开启 `ghcr` 免代理认证时，公开包才可匿名完成此流程；否则公开包也需要代理密码。私有包还需有效的 GitHub PAT。主动登录时会校验提供的凭证，错误密码会登录失败。是否需要代理密码由免认证配置决定，不能仅根据首次 `401` 判断。[Registry 令牌认证规范](https://distribution.github.io/distribution/spec/auth/token/)
+
+配置了 `PROXY_TOKEN` 时，会话令牌由它签名，绑定代理域名和单个仓库的只读范围，有效期最多 60 秒；到期由客户端重新申请，轮换代理密码会使已签发会话失效。没有代理密码的匿名部署直接使用 GHCR 短期令牌，由 GHCR 校验权限和有效期。两种模式都不在代理会话中携带 PAT，也不共享保存私有令牌。
+
+携带 Registry Bearer 或 GitHub 凭证的下载**完全绕过共享 Cache API，并禁止 GHCR 回源缓存**，每次读取交由 GHCR 校验。直接使用 Basic 或独立 GitHub 认证头的 HTTP 请求逐次兑换上游令牌；Docker/ORAS 在会话有效期内复用短期令牌。无效凭证或权限不足不会降级到匿名访问或已有公开缓存。权限撤销后的生效时间取决于 GHCR 令牌的有效期。
 
 HTTP 客户端可用 `Authorization: Bearer <PROXY_TOKEN>` 提供代理密码，并通过独立请求头提供 GitHub 凭证：
 
@@ -294,6 +302,8 @@ docker logout proxy.example.com
 ```
 
 `unset` 仅清除 Bash 变量；Docker 登录信息由凭证助手或客户端配置文件管理，使用 `docker logout` 删除。`ghcr.io` 与代理域名使用独立的登录配置。客户端凭证的保存方式见 [Docker 登录文档](https://docs.docker.com/reference/cli/docker/login/)。
+
+未配置凭证助手时，Docker 可能在客户端配置文件中保存可还原的登录信息。限制该文件的访问权限，避免将它放入共享目录、公开备份或代码仓库；可按 Docker 文档配置凭证助手。
 
 ## 下载 OCI 产物及直接使用 HTTPS
 
@@ -327,6 +337,8 @@ oras pull proxy.example.com/owner/private-artifact:tag --output ./downloads
 /v2/owner/image/manifests/sha256:<digest>
 /v2/owner/image/blobs/sha256:<digest>
 ```
+
+Registry 客户端使用 `GET /__registry/token?service=ghcr.io` 完成握手；按仓库申请时增加 `scope=repository:owner/image:pull`。仅接受单个只读范围，不支持 push、目录权限、外部 realm 或自定义上游 service。不要把 PAT 或代理密码放入查询参数。所有远程 Registry 请求必须使用 HTTPS。
 
 HTTP 下载另支持 `/ghcr.io/v2/...` 别名。Docker 镜像名中直接替换域名即可。OCI 客户端可通过上述 manifests/blobs 接口，按标签或摘要下载公开/私有产物；上传、删除、仓库目录、标签列表和 referrers 发现接口不在支持范围内。引用外部域名的 foreign layer 不会通过此代理下载。
 
@@ -566,7 +578,7 @@ npm run deploy -- --dry-run
 
 | 现象 | 排查方法 |
 | --- | --- |
-| 返回 401 或弹出 Basic 登录框 | 当前类型需要代理认证。GitHub 文件和公开 GHCR 包输入实际代理密码；私有 GHCR 使用真实 GitHub 用户名和复合密码。浏览器可以响应 Basic 提示，但不会自动复用 Docker 的登录信息 |
+| 返回 401 或弹出 Basic 登录框 | GitHub 文件按所选策略使用代理密码。Registry 的首次 Bearer 401 属于正常握手，Docker/ORAS 会自动处理；持续失败时检查登录凭证、令牌是否过期，以及代理前方是否拦截认证头 |
 | 返回 503，提示配置 `PROXY_TOKEN` | 目标 Worker 尚未设置 Secret；运行 `npm run secret:put`，确认账号和 Worker 名称正确 |
 | 返回 503，提示缺少限流绑定 | 检查 `wrangler.local.jsonc` 是否保留两个 `ratelimits` 绑定，并重新部署 |
 | 返回 403，提示仓库不允许 | 检查对应白名单，Gist 要填写 `user/gist-id`；空字符串表示禁止全部该类仓库 |

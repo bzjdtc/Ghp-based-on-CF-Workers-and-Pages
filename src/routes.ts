@@ -9,12 +9,18 @@ export interface Route {
   ping: boolean;
   ttl: number;
   git?: "refs" | "upload-pack";
+  token?: boolean;
 }
 
 const NAME = /^[a-zA-Z0-9._-]+$/;
 const COMPONENT = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const TAG = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/;
+
+export function validRegistryRepository(repository: string): boolean {
+  const parts = repository.split("/");
+  return parts.length >= 2 && repository.length <= 255 && parts.every(part => COMPONENT.test(part));
+}
 
 const MEDIA_TYPES = [
   "application/vnd.oci.image.index.v1+json",
@@ -80,6 +86,10 @@ function gitRoute(parts: string[], url: URL): Route | null {
 }
 
 export function buildRoute(url: URL): Route | null {
+  if (url.pathname === "/__registry/token") {
+    return { kind: "ghcr", type: "ghcr", token: true, target: new URL("https://ghcr.io/token"),
+      repository: "", manifest: false, ping: false, ttl: 0 };
+  }
   const fullGit = url.pathname.match(/^\/https:\/\/github\.com(\/.*)$/i);
   if (fullGit) {
     const parts = pathParts(fullGit[1]);
@@ -110,8 +120,7 @@ export function buildRoute(url: URL): Route | null {
     const operation = parts.at(-2);
     const reference = parts.at(-1)!;
     const repository = parts.slice(1, -2);
-    if (repository.length < 2 || repository.join("/").length > 255 ||
-      !repository.every(part => COMPONENT.test(part))) return null;
+    if (!validRegistryRepository(repository.join("/"))) return null;
     const manifest = operation === "manifests";
     if (!(manifest ? DIGEST.test(reference) || TAG.test(reference) :
       operation === "blobs" && DIGEST.test(reference))) return null;

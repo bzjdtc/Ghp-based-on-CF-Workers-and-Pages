@@ -1,6 +1,7 @@
 import { buildRoute, repositoryAllowed, manifestAccept, type Route } from "./routes";
-import { fetchUpstream, UpstreamError } from "./upstream";
+import { fetchUpstream, requestRegistryToken, UpstreamError } from "./upstream";
 import { authorize, type Access } from "./auth";
+import { issueRegistrySession, registryChallenge, registryTokenRepository } from "./registry";
 
 interface Env {
   PROXY_TOKEN?: string;
@@ -26,6 +27,17 @@ export default {
     try {
       return await handleRequest(request, env, ctx);
     } catch (error) {
+      if (error instanceof UpstreamError && error.registryDenied &&
+        !request.headers.get("Authorization") && !request.headers.has("X-GHCR-Authorization")) {
+        const url = new URL(request.url);
+        const route = buildRoute(url);
+        if (route?.kind === "ghcr" && !route.token) {
+          return jsonResponse({ errors: [{ code: "UNAUTHORIZED", message: "Registry token required" }] }, 401, {
+            "WWW-Authenticate": registryChallenge(url, route.repository),
+            "Docker-Distribution-Api-Version": "registry/2.0",
+          });
+        }
+      }
       // Avoid logging attacker-triggered upstream failures or signed URLs/secrets.
       return jsonResponse({ error: error instanceof UpstreamError
         ? error.message : "Internal proxy error" }, error instanceof UpstreamError ? error.status : 500);
@@ -40,7 +52,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   }
   if (url.href.length > 8192) return jsonResponse({ error: "URL too long" }, 414);
   const route = buildRoute(url);
-  const methods = route?.git === "upload-pack" ? ["POST", "OPTIONS"] : ["GET", "HEAD", "OPTIONS"];
+  const methods = route?.git === "upload-pack" ? ["POST", "OPTIONS"]
+    : route?.token ? ["GET", "OPTIONS"] : ["GET", "HEAD", "OPTIONS"];
   if (!methods.includes(request.method)) {
     return jsonResponse({ error: "Method not allowed" }, 405, { Allow: methods.join(", ") });
   }
@@ -56,6 +69,10 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     key: request.headers.get("CF-Connecting-IP") ?? "unknown",
   });
   if (!success) return rateLimited();
+  if (route?.kind === "ghcr" && url.protocol !== "https:" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    return jsonResponse({ error: "Registry requires HTTPS" }, 400);
+  }
 
   // Only validated route types can opt out of proxy authentication. Both the
   // switch and an exact list entry are required; missing settings fail closed.
@@ -64,10 +81,23 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   if (!anonymous && !env.PROXY_TOKEN) {
     return jsonResponse({ error: "Configure PROXY_TOKEN before using the proxy" }, 503);
   }
-  const access: Access = await authorize(request, env.PROXY_TOKEN, route?.kind === "ghcr", anonymous);
+  if (route?.token) {
+    const repository = registryTokenRepository(url);
+    if (repository === null) return jsonResponse({ error: "Invalid registry token service or pull scope" }, 400);
+    route.repository = repository;
+  }
+  if (route?.ping && !request.headers.get("Authorization") && !request.headers.has("X-GHCR-Authorization")) {
+    if (!(await env.TOTAL_RATE_LIMITER.limit({ key: "all-downloads" })).success) return rateLimited();
+    return jsonResponse({ errors: [{ code: "UNAUTHORIZED", message: "Registry token required" }] }, 401, {
+      "WWW-Authenticate": registryChallenge(url), "Docker-Distribution-Api-Version": "registry/2.0",
+    });
+  }
+  const access: Access = await authorize(request, env.PROXY_TOKEN, route?.kind === "ghcr", anonymous,
+    route?.kind === "ghcr" && !route.token ? { repository: route.repository, origin: url.origin } : undefined);
   if (!access.authorized) {
     return jsonResponse({ error: "Unauthorized" }, 401, {
-      "WWW-Authenticate": 'Basic realm="GitHub / GHCR Proxy", charset="UTF-8"',
+      "WWW-Authenticate": route?.kind === "ghcr" ? registryChallenge(url, route.repository)
+        : 'Basic realm="GitHub / GHCR Proxy", charset="UTF-8"',
       "Docker-Distribution-Api-Version": "registry/2.0",
     });
   }
@@ -76,7 +106,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   if (!route) return jsonResponse({ error: "Unsupported GitHub / GHCR download URL" }, 404);
   const allowlist = route.kind === "ghcr"
     ? env.ALLOWED_GHCR_REPOSITORIES : env.ALLOWED_GITHUB_REPOSITORIES;
-  if (!repositoryAllowed(route, allowlist)) {
+  if (!(route.token && !route.repository) && !repositoryAllowed(route, allowlist)) {
     return jsonResponse({ error: "Repository is not allowed" }, 403);
   }
   if (route.manifest && !manifestAccept(request)) {
@@ -84,6 +114,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   }
   const total = await env.TOTAL_RATE_LIMITER.limit({ key: "all-downloads" });
   if (!total.success) return rateLimited();
+  if (route.token) {
+    const upstream = await requestRegistryToken(route.repository, request.signal, access.ghcrAuthorization);
+    const session = await issueRegistrySession(upstream.value, env.PROXY_TOKEN, route.repository, url.origin,
+      upstream.expiresIn, !!access.proxyAuthenticated);
+    return jsonResponse({ ...session, issued_at: new Date().toISOString() }, 200, {
+      Pragma: "no-cache", Expires: "0", "Docker-Distribution-Api-Version": "registry/2.0",
+    });
+  }
   if (route.git) {
     const protocol = request.headers.get("Git-Protocol");
     if (protocol !== null && !/^version=[012]$/.test(protocol)) {
@@ -105,7 +143,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     // API. The bounded POST body can be replayed only on safe Git redirects.
     return clientResponse(await fetchUpstream(route, request, undefined, body), request, route);
   }
-  if (route.ping && !access.ghcrAuthorization) {
+  if (route.ping && !access.ghcrAuthorization && !access.registryToken) {
     return new Response(request.method === "HEAD" ? null : "{}", {
       headers: { ...CORS_HEADERS, "Docker-Distribution-Api-Version": "registry/2.0",
         "Content-Type": "application/json", "Cache-Control": "no-store" },
@@ -119,8 +157,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   }
   // Credentialed GHCR reads must always reach GHCR for authorization. They
   // cannot read public cache entries or write private bytes into that cache.
-  if (access.ghcrAuthorization) {
-    return clientResponse(await fetchUpstream(route, request, access.ghcrAuthorization), request, route);
+  if (access.ghcrAuthorization || access.registryToken) {
+    return clientResponse(await fetchUpstream(route, request, access.ghcrAuthorization, undefined, access.registryToken), request, route);
   }
   const cache = (caches as CacheStorage & { default: Cache }).default;
   const key = cacheKey(url.origin, route, request);
@@ -167,7 +205,7 @@ async function gitRequestBody(request: Request): Promise<Uint8Array<ArrayBuffer>
       if (timedOut) return jsonResponse({ error: "Git request body timed out" }, 408);
       if (done) break;
       if (size + value.byteLength > MAX_GIT_REQUEST_BYTES) {
-        await reader.cancel();
+        void reader.cancel().catch(() => {});
         return jsonResponse({ error: "Git request body exceeds 1 MiB" }, 413);
       }
       bytes.set(value, size);

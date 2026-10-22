@@ -1,56 +1,7 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
-
-// Exercise the real workerd runtime using the tools shipped with Wrangler.
-const require = createRequire(import.meta.url);
-const wranglerRequire = createRequire(require.resolve("wrangler"));
-const { build } = wranglerRequire("esbuild");
-const { Miniflare, convertV4MiniflareOptions, Response: MockResponse, Log, LogLevel } = wranglerRequire("miniflare");
-const { outputFiles } = await build({
-  entryPoints: ["src/index.ts"], bundle: true, write: false, format: "esm",
-});
-const script = outputFiles[0].text;
-const secret = "test-proxy-secret";
-const digest = "sha256:" + "a".repeat(64);
-const manifestType = "application/vnd.oci.image.manifest.v1+json";
-
-function basic(username, password) {
-  return "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
-}
-
-function privateHeaders(username = "alice", pat = "ghp_test_alice", proxySecret = secret) {
-  return { Authorization: basic(username, `${proxySecret}:${pat}`) };
-}
-
-function fixture(options = {}) {
-  const requests = [];
-  const mf = new Miniflare(convertV4MiniflareOptions({
-    modules: true, script, compatibilityDate: "2026-08-23", cf: false,
-    log: new Log(LogLevel.ERROR),
-    bindings: { PROXY_TOKEN: secret, ALLOW_ANONYMOUS: "true", ANONYMOUS_ROUTES: "gist", ...options.bindings },
-    ratelimits: options.ratelimits ?? {
-      IP_RATE_LIMITER: { namespace_id: "1", simple: { limit: 10000, period: 60 } },
-      TOTAL_RATE_LIMITER: { namespace_id: "2", simple: { limit: 10000, period: 60 } },
-    },
-    async outboundService(request) {
-        const entry = { url: request.url, method: request.method,
-          headers: Object.fromEntries(request.headers) };
-        if (options.captureBody && request.body) entry.body = Buffer.from(await request.arrayBuffer());
-        requests.push(entry);
-        if (options.upstream) return options.upstream(request, requests);
-        return new MockResponse("hello", { headers: {
-          "Content-Length": "5", "ETag": '"hello"', "Cache-Control": "public, max-age=3600",
-        } });
-    },
-  }));
-  return { mf, requests, fetch(path, init = {}) {
-    return mf.dispatchFetch("https://proxy.test" + path, {
-      ...init, headers: { Authorization: `Bearer ${secret}`, ...init.headers },
-    });
-  } };
-}
+import { fixture, secret, digest, manifestType, basic, privateHeaders, MockResponse } from "./helpers/runtime.mjs";
 
 test("download routing, authorization, and cache behavior in workerd", async t => {
   const f = fixture();
@@ -161,7 +112,8 @@ test("anonymous route selection is exact and controlled by the master switch", a
         for (const [type, paths] of Object.entries(types)) {
           for (const path of paths) {
             const response = await f.fetch(path, { method: "HEAD", headers: { Authorization: "" } });
-            assert.equal(response.status, type === selected ? 200 : 401, path);
+            const ping = path === "/v2/" || path === "/ghcr.io/v2/";
+            assert.equal(response.status, type === selected && !ping ? 200 : 401, path);
             await response.text();
           }
         }
@@ -233,7 +185,8 @@ test("public GHCR supports native and composite private credentials with a confi
   }
   assert.equal(f.requests.length, 12, "all credentialed requests bypass the cache");
   for (const headers of [{ Authorization: "" }, { Authorization: basic("bob", "invalid-pat") }]) {
-    assert.equal((await f.fetch(path, { headers })).status, 403, "opening the proxy does not open private packages");
+    assert.equal((await f.fetch(path, { headers })).status, headers.Authorization ? 403 : 401,
+      "opening the proxy does not open private packages");
   }
   assert.equal((await f.fetch(path, { headers: { Authorization: "Basic !!!" } })).status, 400);
 });
@@ -514,7 +467,7 @@ test("configuration fails closed, allowlists, and rate limits", async t => {
   await t.test("missing secret is blocked; anonymous access requires explicit opt-in", async () => {
     for (const [bindings, expected] of [
       [{ PROXY_TOKEN: "" }, 503],
-      [{ PROXY_TOKEN: "", ALLOW_ANONYMOUS: "true", ANONYMOUS_ROUTES: "ghcr" }, 200],
+      [{ PROXY_TOKEN: "", ALLOW_ANONYMOUS: "true", ANONYMOUS_ROUTES: "ghcr" }, 401],
       [{ PROXY_TOKEN: secret, ALLOW_ANONYMOUS: "true" }, 401],
     ]) {
       const f = fixture({ bindings });
@@ -599,7 +552,7 @@ test("client-supplied GHCR credentials for private images and OCI artifacts", as
   } });
   t.after(() => f.mf.dispose());
 
-  await t.test("Docker login verifies the GitHub PAT without requesting repository access", async () => {
+  await t.test("explicit Basic ping validates the GitHub PAT without requesting repository access", async () => {
     const before = f.requests.length;
     const response = await f.fetch("/v2/", { headers: privateHeaders() });
     assert.equal(response.status, 200);

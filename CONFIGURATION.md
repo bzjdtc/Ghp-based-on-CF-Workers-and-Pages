@@ -63,7 +63,9 @@ npx wrangler deploy --config wrangler.local.jsonc --dry-run
 
 `git` 控制公开 GitHub 仓库的 Git HTTPS 克隆与拉取。Git 与文件下载共用 `ALLOWED_GITHUB_REPOSITORIES`，填写 `owner/repo`，不带 `.git`。免认证列表中的 `raw` 或 `archive` 不会自动开放 Git；推送、SSH、Git LFS 和私有 Git 仓库不受支持。完整使用方法见 [README.md](README.md#git-https-克隆与拉取)。
 
-开放 `ghcr` 免代理认证后，公开包可匿名下载；私有包需要 GitHub 用户名/PAT，可使用 Basic 登录或 `X-GHCR-Authorization` 请求头。配置了 `PROXY_TOKEN` 时也支持 `代理密码:PAT` 复合密码。携带 GitHub 凭证的请求逐次验证权限并跳过共享缓存。
+开放 `ghcr` 免代理认证后，公开包可匿名下载；私有包需要 GitHub 用户名/PAT，可使用 Docker/ORAS 登录或 HTTP 的 `X-GHCR-Authorization` 请求头。配置了 `PROXY_TOKEN` 时也支持 `代理密码:PAT` 复合密码。Registry 首次访问 `/v2/` 会返回 Bearer 401，客户端通过 `/__registry/token` 自动握手，主动登录时校验凭证。
+
+`PROXY_TOKEN` 同时用于签名最多 60 秒、绑定仓库与代理域名的 Registry 会话，轮换后旧会话失效。没有该 Secret 的匿名部署使用 GHCR 短期令牌，不增加新的必填配置。令牌端点和下载都执行限流、仓库白名单；不支持扩大为 push 范围。携带凭证或会话令牌的下载不进入共享缓存。
 
 更改配置后执行 `npm run deploy` 才会在线上生效。
 

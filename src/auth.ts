@@ -1,6 +1,10 @@
+import { validRegistryToken, verifyRegistrySession } from "./registry";
+
 export interface Access {
   authorized: boolean;
   ghcrAuthorization?: string;
+  registryToken?: string;
+  proxyAuthenticated?: boolean;
   error?: string;
 }
 
@@ -34,12 +38,24 @@ async function sameSecret(candidate: string, secret: string): Promise<boolean> {
 }
 
 export async function authorize(request: Request, secret: string | undefined,
-  ghcr: boolean, anonymous = false): Promise<Access> {
+  ghcr: boolean, anonymous = false, registry?: { repository: string; origin: string }): Promise<Access> {
   // Public GitHub file routes never interpret or forward client credentials.
   if (anonymous && !ghcr) return { authorized: true };
   const value = request.headers.get("Authorization") ?? "";
-  if (value.length > 8192) return { authorized: anonymous,
-    error: anonymous ? "Invalid GHCR credentials" : undefined };
+  if (value.length > 32_775) return { authorized: false };
+  if (ghcr && !registry && !secret && /^Bearer /i.test(value)) return { authorized: false };
+  if (registry && /^Bearer /i.test(value)) {
+    const bearer = value.slice(7);
+    if (!secret || !await sameSecret(bearer, secret)) {
+      const token = secret ? await verifyRegistrySession(bearer, secret, registry.repository, registry.origin, anonymous)
+        : anonymous && validRegistryToken(bearer) ? bearer : undefined;
+      if (!token) return { authorized: false };
+      if (request.headers.has("X-GHCR-Authorization")) return { authorized: true, error: "Conflicting GHCR credentials" };
+      return { authorized: true, registryToken: token };
+    }
+  }
+  if (value.length > 8192) return { authorized: false };
+  if (ghcr && value && !/^(?:Basic|Bearer) /i.test(value)) return { authorized: true, error: "Invalid GHCR credentials" };
   const basic = basicCredentials(value);
   if (ghcr && /^Basic(?: |$)/i.test(value) && !basic) {
     return { authorized: anonymous || !secret, error: "Invalid GHCR credentials" };
@@ -63,7 +79,9 @@ export async function authorize(request: Request, secret: string | undefined,
     upstream = ghcrBasic(basic.username, basic.password);
     if (!upstream) return { authorized: true, error: "Invalid GHCR credentials" };
   }
+  const proxyAuthenticated = !!secret && authorized;
   if (!authorized && anonymous) {
+    if (value && !basic) return { authorized: false };
     authorized = true;
     // Also accept native username/PAT on public GHCR routes when a proxy
     // secret exists. Valid composite passwords above retain their meaning.
@@ -81,5 +99,5 @@ export async function authorize(request: Request, secret: string | undefined,
     upstream = credentials && ghcrBasic(credentials.username, credentials.password) || undefined;
     if (!upstream) return { authorized: true, error: "X-GHCR-Authorization must contain GitHub Basic credentials" };
   }
-  return { authorized: true, ghcrAuthorization: upstream };
+  return { authorized: true, ghcrAuthorization: upstream, proxyAuthenticated };
 }
